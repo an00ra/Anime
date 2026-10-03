@@ -1,74 +1,135 @@
 package com.samehadaku
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.runBlocking
 import org.jsoup.nodes.Element
 
 class Samehadaku : MainAPI() {
     override var mainUrl = "https://v2.samehadaku.how"
     override var name = "Samehadaku"
-    override var lang = "id"
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
-
     override val hasMainPage = true
+    override var lang = "id"
+    override val hasDownloadSupport = true
+    override val supportedTypes = setOf(
+        TvType.Anime,
+        TvType.AnimeMovie,
+        TvType.OVA
+    )
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val document = app.get(mainUrl).document
-        val homeItems = ArrayList<HomePageList>()
-
-        val latestEpisodes = document.select("div.post-show ul li").mapNotNull { element ->
-            element.toSearchResult()
+    companion object {
+        fun getType(t: String): TvType = when {
+            t.contains("OVA", true) || t.contains("Special", true) -> TvType.OVA
+            t.contains("Movie", true) -> TvType.AnimeMovie
+            else -> TvType.Anime
         }
-        if (latestEpisodes.isNotEmpty()) {
-            homeItems.add(HomePageList("Episode Terbaru", latestEpisodes))
-        }
-
-        return HomePageResponse(homeItems)
-    }
-
-    private fun Element.toSearchResult(): SearchResponse? {
-        val title = this.selectFirst("h2.entry-title a, div.dtla h2 a")?.text() ?: return null
-        val href = this.selectFirst("a")?.attr("href") ?: return null
-        val posterUrl = this.selectFirst("img")?.attr("src")
-
-        return newAnimeSearchResponse(title, href, TvType.Anime) {
-            this.posterUrl = posterUrl
+        fun getStatus(t: String): ShowStatus = when (t) {
+            "Completed" -> ShowStatus.Completed
+            "Ongoing" -> ShowStatus.Ongoing
+            else -> ShowStatus.Completed
         }
     }
+
+    override val mainPage = mainPageOf(
+		"anime-terbaru/page/%d" to "Terbaru",
+		"genre/action/page/%d/" to "Action",
+		"genre/sci-fi/page/%d/" to "SCI-FI",
+        "genre/school/page/%d/" to "School",
+		"genre/fantasy/page/%d/" to "Fantasy",
+		"genre/adventure/page/%d/" to "Adventure",
+    )
+	
+	
+	override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+		val document = app.get("$mainUrl/${request.data.format(page)}").document
+		val items = when (request.name) {
+			"Terbaru" -> document.select("li[itemtype='http://schema.org/CreativeWork']")
+			else -> document.select("article.animpost")
+		}
+		val homeList = items.mapNotNull {
+			if (request.name == "Terbaru") it.toLatestAnimeResult()
+			else it.toSearchResult()
+		}
+		return newHomePageResponse(request.name, homeList)
+	}
+
+	private fun Element.toSearchResult(): AnimeSearchResponse? {
+		val a = this.selectFirst("div.animepost a") ?: return null
+		val title = a.selectFirst("div.title h2")?.text()?.trim() ?: a.attr("title") ?: return null
+		val href = fixUrlNull(a.attr("href")) ?: return null
+		val posterUrl = fixUrlNull(this.selectFirst("div.content-thumb img")?.attr("src"))
+		val statusText = a.selectFirst("div.data > div.type")?.text()?.trim() ?: ""
+
+		return newAnimeSearchResponse(title, href, TvType.Anime) {
+			this.posterUrl = posterUrl
+			addDubStatus(statusText)
+		}
+	}
+
+	private fun Element.toLatestAnimeResult(): AnimeSearchResponse? {
+		val a = this.selectFirst("div.thumb a") ?: return null
+		val title = this.selectFirst("h2.entry-title a")?.text()?.trim() ?: a.attr("title") ?: return null
+		val href = fixUrlNull(a.attr("href")) ?: return null
+		val posterUrl = fixUrlNull(a.selectFirst("img")?.attr("src"))
+		val epNum = this.selectFirst("div.dtla author")?.text()?.toIntOrNull()
+
+		return newAnimeSearchResponse(title, href, TvType.Anime) {
+			this.posterUrl = posterUrl
+			addSub(epNum)
+		}
+	}
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/?s=$query"
-        val document = app.get(url).document
-
-        return document.select("article.animpost, div.relat div.animpost").mapNotNull { element ->
-            val title = element.selectFirst("h2")?.text() ?: return@mapNotNull null
-            val href = element.selectFirst("a")?.attr("href") ?: return@mapNotNull null
-            val posterUrl = element.selectFirst("img")?.attr("src")
-
-            newAnimeSearchResponse(title, href, TvType.Anime) {
-                this.posterUrl = posterUrl
-            }
-        }
+        val document = app.get("$mainUrl/?s=$query").document
+        return document.select("main#main div.animepost").mapNotNull { it.toSearchResult() }
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url).document
-        val title = document.selectFirst("h1.entry-title")?.text() ?: "Unknown"
-        val poster = document.selectFirst("div.thumb img, div.infoanime div.thumb img")?.attr("src")
-        val description = document.selectFirst("div.entry-content, div.desc")?.text()
+    override suspend fun load(url: String): LoadResponse? {
+        val fixUrl = if (url.contains("/anime/")) url
+        else app.get(url).document.selectFirst("div.nvs.nvsc a")?.attr("href")
 
-        val episodes = document.select("div.lrf ul li, div.epsul ul li").mapNotNull { element ->
-            val epTitle = element.selectFirst("a")?.text() ?: return@mapNotNull null
-            val epHref = element.selectFirst("a")?.attr("href") ?: return@mapNotNull null
-            newEpisode(epHref) {
-                this.name = epTitle
-            }
+        val document = app.get(fixUrl ?: return null).document
+
+        val title = document.selectFirst("h1.entry-title")?.text()?.removeBloat() ?: return null
+        val poster = document.selectFirst("div.thumb > img")?.attr("src")
+        val tags = document.select("div.genre-info > a").map { it.text() }
+        val year = document.selectFirst("div.spe > span:contains(Rilis)")?.ownText()?.let {
+            Regex("\\d,\\s(\\d*)").find(it)?.groupValues?.getOrNull(1)?.toIntOrNull()
         }
+        val status = getStatus(document.selectFirst("div.spe > span:contains(Status)")?.ownText() ?: return null)
+        val type = getType(document.selectFirst("div.spe > span:contains(Type)")?.ownText()?.trim()?.lowercase() ?: "tv")
+        val rating = document.selectFirst("span.ratingValue")?.text()?.trim()?.toRatingInt()
+        val description = document.select("div.desc p").text().trim()
+        val trailer = document.selectFirst("div.trailer-anime iframe")?.attr("src")
 
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster
-            this.plot = description
+        val episodes = document.select("div.lstepsiode.listeps ul li").mapNotNull {
+            val header = it.selectFirst("span.lchx > a") ?: return@mapNotNull null
+            val episode = Regex("Episode\\s?(\\d+)").find(header.text())?.groupValues?.getOrNull(1)?.toIntOrNull()
+            val link = fixUrl(header.attr("href"))
+            newEpisode(link) { this.episode = episode }
+        }.reversed()
+
+        val recommendations = document.select("aside#sidebar ul li").mapNotNull { it.toSearchResult() }
+
+        val tracker = APIHolder.getTracker(listOf(title), TrackerType.getTypes(type), year, true)
+
+        return newAnimeLoadResponse(title, url, type) {
+            engName = title
+            posterUrl = tracker?.image ?: poster
+            backgroundPosterUrl = tracker?.cover
+            this.year = year
             addEpisodes(DubStatus.Subbed, episodes)
+            showStatus = status
+            this.rating = rating
+            plot = description
+            addTrailer(trailer)
+            this.tags = tags
+            this.recommendations = recommendations
+            addMalId(tracker?.malId)
+            addAniListId(tracker?.aniId?.toIntOrNull())
         }
     }
 
@@ -76,19 +137,52 @@ class Samehadaku : MainAPI() {
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (Video) -> Unit
+        callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
 
-        document.select("div#server iframe, div.pembed iframe").forEach { iframe ->
-            var src = iframe.attr("src")
-            if (src.startsWith("//")) {
-                src = "https:$src"
-            }
-            if (src.isNotBlank()) {
-                loadExtractor(src, data, subtitleCallback, callback)
+        document.select("div#downloadb li").apmap { el ->
+            el.select("a").apmap {
+                loadFixedExtractor(
+                    fixUrl(it.attr("href")),
+                    el.select("strong").text(),
+                    "$mainUrl/",
+                    subtitleCallback,
+                    callback
+                )
             }
         }
         return true
     }
+
+    private suspend fun loadFixedExtractor(
+        url: String,
+        name: String,
+        referer: String? = null,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        loadExtractor(url, referer, subtitleCallback) { link ->
+            runBlocking {
+                callback.invoke(
+                    newExtractorLink(link.name, link.name, link.url, link.type) {
+                        this.referer = link.referer
+                        this.quality = name.fixQuality()
+                        this.headers = link.headers
+                        this.extractorData = link.extractorData
+                    }
+                )
+            }
+        }
+    }
+
+    private fun String.fixQuality(): Int = when (this.uppercase()) {
+        "4K" -> Qualities.P2160.value
+        "FULLHD" -> Qualities.P1080.value
+        "MP4HD" -> Qualities.P720.value
+        else -> this.filter { it.isDigit() }.toIntOrNull() ?: Qualities.Unknown.value
+    }
+
+    private fun String.removeBloat(): String =
+        this.replace(Regex("(Nonton)|(Anime)|(Subtitle\\sIndonesia)"), "").trim()
 }
