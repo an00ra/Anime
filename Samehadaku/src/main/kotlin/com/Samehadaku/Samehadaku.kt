@@ -4,7 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.nodes.Element
 
-class ExampleProvider : MainAPI() {
+class Samehadaku : MainAPI() {
     override var mainUrl = "https://v2.samehadaku.how" // URL domain target Samehadaku
     override var name = "Samehadaku"
     override var lang = "id"
